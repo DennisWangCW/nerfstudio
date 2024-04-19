@@ -889,7 +889,6 @@ def compute_coordinate_transform_matrix(chunk1: Path, chunk2: Path):
         transitions, rotations = [], []
         positions1, positions2 = [], []
         untrusted_frames = []
-        
 
         for id in shared_ids:
             mat1 = np.array(trans1[original_ids1[id]])
@@ -914,6 +913,7 @@ def compute_coordinate_transform_matrix(chunk1: Path, chunk2: Path):
         scale = distances2 / distances1
         print("new distances1: ", distances1)
         print("new distances2: ", distances2)
+        print("estimated scale is: ", scale)
 
         for i in range(len(shared_ids)):
             mat1 = np.array(trans1[original_ids1[shared_ids[i]]])
@@ -949,13 +949,13 @@ def compute_coordinate_transform_matrix(chunk1: Path, chunk2: Path):
     return untrusted_frames
 
 
-def recursive_compute_trans_matrix(chunk_path: str):
-    with open(os.path.join(chunk_path , "transforms.json"), 'r') as f:
+def recursive_compute_trans_matrix(chunk_path: Path):
+    with open(chunk_path.joinpath("transforms.json"), 'r') as f:
         data = json.load(f)
         if "precedent_chunk" in data.keys() and "coordination_transform_matrix" in data.keys():
             transform_matrix = data["coordination_transform_matrix"]
             scale = data["scale"]
-            precedent_chunk_path = data["precedent_chunk"]
+            precedent_chunk_path = Path(data["precedent_chunk"])
             pre_transform_matrix, pre_scale = recursive_compute_trans_matrix(precedent_chunk_path)
             transform_matrix =  np.dot(pre_transform_matrix, transform_matrix)
             scale =  pre_scale * scale
@@ -968,11 +968,12 @@ def merge_frames(transform_info_file: Path, output_file: Path):
     with open(transform_info_file.absolute(),'r') as f:
         data = json.load(f)
         chunk_paths = data["chunk_path"]
+        chunk_paths = [Path(chunk_path) for chunk_path in chunk_paths]
         transform_matrix = np.array(data["transform_matrix"])
     frames = []
     stamps = dict()
     for ck_path, trans_mat in zip(chunk_paths, transform_matrix):
-        with open(os.path.join(ck_path, "transforms.json"),'r') as f:
+        with open(ck_path.joinpath("transforms.json"),'r') as f:
             data = json.load(f)
             data_keys = list(data.keys())
             for k in data_keys:
@@ -1000,7 +1001,7 @@ def merge_camera_intrinsics(chunk_paths: List[Path], output_file: Path):
     intrinsics_val = [0.0 for _ in intrinsics_key]
     intrinsics = dict(zip(intrinsics_key, intrinsics_val))
     for chunk_path in chunk_paths:
-        with open(os.path.join(chunk_path.absolute(), "transforms.json"), 'r') as f:
+        with open(chunk_path.joinpath("transforms.json"), 'r') as f:
             data = json.load(f)
             for k in intrinsics_key:
                 intrinsics[k] += data[k]
@@ -1021,14 +1022,7 @@ def transform_point_cloud(points, transform_matrix, scale):
     homogeneous_points = np.hstack((points / scale, np.ones((len(points), 1))))
     transformed_points = np.dot(homogeneous_points, transform_matrix.T)
     transformed_points = transformed_points[:, :3]
-
-    rotation = transform_matrix[:3, :3]
-    transition = transform_matrix[:3, 3]
-    new_points = points / scale
-    rot_points = np.dot(new_points, rotation.T)
-    trt_points = rot_points + transition
-    return trt_points
-    # return transformed_points
+    return transformed_points
 
 
 def create_output(positions, colors, filename):
@@ -1056,31 +1050,40 @@ def create_output(positions, colors, filename):
         f.write(old)
 
 
+def recursive_transform(chunk_path: Path, positions, colors):
+    transforms_file = chunk_path.joinpath("transforms.json")
+    with open(transforms_file, 'r') as f:
+        data = json.load(f)
+        if "precedent_chunk" in data.keys() and "coordination_transform_matrix" in data.keys():
+            transform_matrix = data["coordination_transform_matrix"]
+            scale = data["scale"]
+            precedent_chunk_path = Path(data["precedent_chunk"])
+            ply_data1 = PlyData.read(precedent_chunk_path.joinpath("sparse_pc.ply"))
+            points1 = np.array([(vertex['x'], vertex['y'], vertex['z'], vertex['red'], vertex['green'], vertex['blue']) for vertex in ply_data1['vertex']])
+            positions1 = points1[:, :3]
+            colors1 = points1[:, 3:]
+            positions = transform_point_cloud(positions, np.array(transform_matrix), scale)
+            positions = np.concatenate([positions, positions1])
+            colors = np.concatenate([colors, colors1])
+            # create_output(positions=positions, colors=colors, filename=precedent_chunk_path.joinpath("from_{}_sparse_pc.ply".format(precedent_chunk_path.name)))
+            return recursive_transform(precedent_chunk_path, positions=positions, colors=colors)
+        else:
+            return positions, colors
+
+
 def merge_ply_files(transform_info_file: Path, output_file: Path):
-    # Initialize lists to store vertices and faces
-    merged_positions, merged_colors = [], []
     with open(transform_info_file, 'r') as f:
         data = json.load(f)
-        transform_matrices = data["transform_matrix"]
-        scales = data["scale"]
-        chunk_parhs = data["chunk_path"]
-
-    # Iterate through input files
-    for chunk_path, transform_matrix, scale in zip(chunk_parhs, transform_matrices, scales):
-        transform_matrix = np.array(transform_matrix)
-        # Load PLY file
-        ply_data = PlyData.read(os.path.join(chunk_path, 'sparse_pc.ply'))
-
-        # Extract vertices
+        chunk_paths = data["chunk_path"]
+        chunk_paths = [Path(chunk_path) for chunk_path in chunk_paths]
+    
+    merged_positions, merged_colors = [], []
+    for chunk_path in chunk_paths:
+        ply_data = PlyData.read(chunk_path.joinpath("sparse_pc.ply"))
         points = np.array([(vertex['x'], vertex['y'], vertex['z'], vertex['red'], vertex['green'], vertex['blue']) for vertex in ply_data['vertex']])
-
-        # Apply transformation matrix to the points
-        positions = transform_point_cloud(points[:, :3], transform_matrix, scale)
-        colors = points[:, 3:]
-        create_output(positions=positions, colors=colors, filename=os.path.join(chunk_path, 'transformed_sparse_pc.ply'))
+        positions, colors = recursive_transform(chunk_path=chunk_path, positions=points[:, :3], colors=points[:, 3:])
         merged_positions.append(positions)
         merged_colors.append(colors)
-
     merged_positions = np.concatenate(merged_positions)
     merged_colors = np.concatenate(merged_colors)
     create_output(positions=merged_positions, colors=merged_colors, filename=output_file)
@@ -1089,7 +1092,7 @@ def merge_ply_files(transform_info_file: Path, output_file: Path):
 def merge_camera_model(chunk_paths: List[Path], output_file: Path):
     camera_model = ''
     for chunk_path in chunk_paths:
-        with open(os.path.join(chunk_path.absolute(), "transforms.json"), 'r') as f:
+        with open(chunk_path.joinpath("transforms.json"), 'r') as f:
             data = json.load(f)
             if not camera_model:
                 camera_model = data['camera_model']
@@ -1153,7 +1156,7 @@ def merge_chunks(image_dir: Path, output_dir: Path):
     for i in range(len(chunk_paths)-1):
         untrusted_frames.extend(compute_coordinate_transform_matrix(chunk_paths[i], chunk_paths[i+1]))
     for chunk_path in chunk_paths:
-        transform_matrix, scale = recursive_compute_trans_matrix(chunk_path=str(chunk_path.absolute()))
+        transform_matrix, scale = recursive_compute_trans_matrix(chunk_path=chunk_path)
         transform_matrices.append(transform_matrix.tolist())
         scales.append(scale)
     
@@ -1169,6 +1172,7 @@ def merge_chunks(image_dir: Path, output_dir: Path):
     
     new_transforms_json_file = output_dir.joinpath("transforms.json")
     new_ply_file = output_dir.joinpath("sparse_pc.ply")
+    recursive_ply_file = output_dir.joinpath("recursive_sparse.ply")
     merge_camera_intrinsics(chunk_paths, output_file=new_transforms_json_file)
     merge_frames(transform_info_file=transform_info_file, output_file=new_transforms_json_file)
     merge_camera_model(chunk_paths, output_file=new_transforms_json_file)

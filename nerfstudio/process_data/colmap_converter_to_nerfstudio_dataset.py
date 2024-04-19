@@ -119,6 +119,9 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
     """Running colmap in parallel."""
     undistorted: bool = False 
     """Undistorted each images for Gaussian Splatting"""
+    matched_ratio: float = 0.9 
+    """Sometimes colmap cannot found poses for most images, retry until it found! Note that the maximum retry times is 10 """
+
 
     @staticmethod
     def default_colmap_path() -> Path:

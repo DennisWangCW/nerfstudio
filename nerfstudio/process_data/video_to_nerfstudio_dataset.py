@@ -148,8 +148,8 @@ class VideoToNerfstudioDataset(ColmapConverterToNerfstudioDataset):
             process_data_utils.merge_chunks(image_dir=self.sample_dir if not self.undistorted else self.undistorted_dir, output_dir=self.merge_dir)
             CONSOLE.log("[bold green]:tada: Done merging all video/image chunks!")
 
-            process_data_utils.pose_interpolation(image_dir=self.image_dir, merged_dir=self.merge_dir, output_dir=self.merge_dir)
-            process_data_utils.grid_allocation(grid_size=self.grid_size,image_dir=self.image_dir, merged_dir=self.merge_dir, output_dir=self.grid_dir, sampled=False)
+            # process_data_utils.pose_interpolation(image_dir=self.image_dir, merged_dir=self.merge_dir, output_dir=self.merge_dir)
+            # process_data_utils.grid_allocation(grid_size=self.grid_size,image_dir=self.image_dir, merged_dir=self.merge_dir, output_dir=self.grid_dir, sampled=False)
             return
 
         # Run Colmap
