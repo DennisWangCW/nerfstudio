@@ -42,6 +42,23 @@ class BaseConverterToNerfstudioDataset(ABC):
     @property
     def image_dir(self) -> Path:
         return self.output_dir / "images"
+    
+    @property
+    def sample_dir(self) -> Path:
+        return self.output_dir / "samples"
+    
+    @property
+    def merge_dir(self) -> Path:
+        return self.output_dir / "merged"
+    
+    @property
+    def grid_dir(self) -> Path:
+        return self.output_dir / "grids"
+
+    @property
+    def undistorted_dir(self) -> Path:
+        return self.output_dir / "undistorted"
+    
 
     @abstractmethod
     def main(self) -> None:

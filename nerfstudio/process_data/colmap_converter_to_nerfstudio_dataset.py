@@ -101,6 +101,24 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
     """If --use-sfm-depth and this flag is True, also export debug images showing Sf overlaid upon input images."""
     same_dimensions: bool = True
     """Whether to assume all images are same dimensions and so to use fast downscaling with no autorotation."""
+    get_full_images: bool = False
+    """Whether to output all the images of the video."""
+    num_overlapped_chunks: int = 1
+    """The number of overlapped video chunks to split. Video chunks would be stored as images."""
+    target_frames_per_chunk: int = 300
+    """The number images in each video chunk."""
+    chunk_image_sample_strategy: str = "uniform"
+    """Sampling strategies used for sampling images in each video chunk."""
+    overlapped_fraction: float = 1 / 3
+    """Overlapped fraction of two adjacent video/image chunks."""
+    skip_processing_video: bool = False 
+    """Skip the video to image processing procedure."""
+    grid_size: float = 50
+    """Grid size of the covered area."""
+    parallel_colmap: bool = False
+    """Running colmap in parallel."""
+    undistorted: bool = False 
+    """Undistorted each images for Gaussian Splatting"""
 
     @staticmethod
     def default_colmap_path() -> Path:
@@ -120,6 +138,7 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
         image_id_to_depth_path: Optional[Dict[int, Path]] = None,
         camera_mask_path: Optional[Path] = None,
         image_rename_map: Optional[Dict[str, str]] = None,
+        image_reverse_rename_map: Optional[Dict[str, str]] = None,
     ) -> List[str]:
         """Save colmap transforms into the output folder
 
@@ -136,6 +155,7 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
                     image_id_to_depth_path=image_id_to_depth_path,
                     camera_mask_path=camera_mask_path,
                     image_rename_map=image_rename_map,
+                    image_reverse_rename_map=image_reverse_rename_map,
                 )
                 summary_log.append(f"Colmap matched {num_matched_frames} images")
             summary_log.append(colmap_utils.get_matching_summary(num_frames, num_matched_frames))
@@ -175,6 +195,20 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
             )
             return image_id_to_depth_path, summary_log
         return None, summary_log
+
+    def _run_colmap_image_undistortion(self, many_chunks=False):
+        if many_chunks:
+            chunk_paths = self.undistorted_dir.iterdir()
+            for chunk_path in chunk_paths:
+                colmap_utils.run_colmap_image_undistortion(
+                    image_dir=chunk_path,
+                    colmap_cmd=self.colmap_cmd,
+            )
+        else:
+            colmap_utils.run_colmap_image_undistortion(
+                    image_dir=self.undistorted_dir,
+                    colmap_cmd=self.colmap_cmd,
+            )
 
     def _run_colmap(self, mask_path: Optional[Path] = None):
         """

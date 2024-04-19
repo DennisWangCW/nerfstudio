@@ -19,7 +19,6 @@ Tools supporting the execution of COLMAP and preparation of COLMAP-based dataset
 import json
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Union
-
 import appdirs
 import cv2
 import numpy as np
@@ -41,8 +40,18 @@ from nerfstudio.process_data.process_data_utils import CameraModel
 from nerfstudio.utils import colormaps
 from nerfstudio.utils.rich_utils import CONSOLE, status
 from nerfstudio.utils.scripts import run_command
+import subprocess
 
 
+def get_available_gpus():
+    try:
+        result = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'], capture_output=True, text=True)
+        gpu_names = result.stdout.strip().split('\n')
+        return len(gpu_names)
+    except FileNotFoundError:
+        print("nvidia-smi is not installed or Nvidia driver is not properly configured.")
+        return 0
+    
 def get_colmap_version(colmap_cmd: str, default_version: str = "3.8") -> Version:
     """Returns the version of COLMAP.
     This code assumes that colmap returns a version string of the form
@@ -88,6 +97,30 @@ def get_vocab_tree() -> Path:
                     f.flush()
     return vocab_tree_filename
 
+def run_colmap_image_undistortion(
+    image_dir: Path,
+    colmap_cmd: str = "colmap",
+    verbose: bool = False,
+) -> None:
+    img_undist_cmd = [f"{colmap_cmd} image_undistorter",
+        f"--image_path {image_dir / 'input'}",
+        f"--input_path {image_dir / 'distorted' / 'sparse' /' 0'}",
+        f"--output_path {image_dir}",
+        f"--output_type COLMAP"]
+    img_undist_cmd = " ".join(img_undist_cmd)
+    with status(msg="[bold yellow]Running COLMAP image undistortion...", spinner="moon", verbose=verbose):
+        run_command(img_undist_cmd, verbose=verbose)
+    CONSOLE.log("[bold green]:tada: Done undistorting COLMAP images.")
+    
+    sparse_path = image_dir.joinpath("sparse")
+    sparse_path.joinpath("0").mkdir(exist_ok=True, parents=True)
+    # Copy each file from the source directory to the destination directory
+    for file in sparse_path.iterdir():
+        if file.name == '0':
+            continue
+        source_file = sparse_path.joinpath(file)
+        destination_file = sparse_path.joinpath("0").joinpath(file)
+        source_file.replace(destination_file)
 
 def run_colmap(
     image_dir: Path,
@@ -128,6 +161,8 @@ def run_colmap(
         f"--ImageReader.camera_model {camera_model.value}",
         f"--SiftExtraction.use_gpu {int(gpu)}",
     ]
+    if int(gpu):
+        feature_extractor_cmd.append(f"--SiftExtraction.gpu_index={','.join(map(str, range(get_available_gpus())))}")
     if camera_mask_path is not None:
         feature_extractor_cmd.append(f"--ImageReader.camera_mask_path {camera_mask_path}")
     feature_extractor_cmd = " ".join(feature_extractor_cmd)
@@ -142,6 +177,8 @@ def run_colmap(
         f"--database_path {colmap_dir / 'database.db'}",
         f"--SiftMatching.use_gpu {int(gpu)}",
     ]
+    if int(gpu):
+        feature_matcher_cmd.append(f"--SiftMatching.gpu_index={','.join(map(str, range(get_available_gpus())))}")
     if matching_method == "vocab_tree":
         vocab_tree_filename = get_vocab_tree()
         feature_matcher_cmd.append(f'--VocabTreeMatching.vocab_tree_path "{vocab_tree_filename}"')
@@ -387,12 +424,18 @@ def parse_colmap_camera_params(camera) -> Dict[str, Any]:
     return out
 
 
+def calculate_mse(image1, image2):
+    # 计算图像之间的均方误差
+    mse = np.mean((image1 - image2) ** 2)
+    return mse
+
 def colmap_to_json(
     recon_dir: Path,
     output_dir: Path,
     camera_mask_path: Optional[Path] = None,
     image_id_to_depth_path: Optional[Dict[int, Path]] = None,
     image_rename_map: Optional[Dict[str, str]] = None,
+    image_reverse_rename_map: Optional[Dict[str, str]] = None,
     ply_filename="sparse_pc.ply",
     keep_original_world_coordinate: bool = False,
 ) -> int:
@@ -441,14 +484,16 @@ def colmap_to_json(
             c2w[2, :] *= -1
 
         name = im_data.name
+        original_name = name
         if image_rename_map is not None:
             name = image_rename_map[name]
         name = Path(f"./images/{name}")
 
         frame = {
             "file_path": name.as_posix(),
+            "original_path":  image_reverse_rename_map[original_name] if image_reverse_rename_map is not None else "",
             "transform_matrix": c2w.tolist(),
-            "colmap_im_id": im_id,
+            # "colmap_im_id": im_id,
         }
         if camera_mask_path is not None:
             frame["mask_path"] = camera_mask_path.relative_to(camera_mask_path.parent.parent).as_posix()

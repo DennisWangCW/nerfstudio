@@ -88,6 +88,7 @@ class ImagesToNerfstudioDataset(ColmapConverterToNerfstudioDataset):
                 image_rename_map_paths.update(eval_image_rename_map_paths)
 
             image_rename_map = dict((a.name, b.name) for a, b in image_rename_map_paths.items())
+            image_reverse_rename_map = dict((b.name, a.name) for a, b in image_rename_map_paths.items())
             num_frames = len(image_rename_map)
             summary_log.append(f"Starting with {num_frames} images")
 
@@ -107,11 +108,16 @@ class ImagesToNerfstudioDataset(ColmapConverterToNerfstudioDataset):
             summary_log.append(f"Starting with {num_frames} images")
 
         # Run COLMAP
+        # print("image map:\n", image_rename_map)
+        # print("image reverse map:\n", image_reverse_rename_map)
         if not self.skip_colmap:
             require_cameras_exist = True
             self._run_colmap()
             # Colmap uses renamed images
             image_rename_map = None
+        if self.undistorted:
+            process_data_utils.undistorting_images(image_dir=self.image_dir, output_dir=self.undistorted_dir)
+            self._run_colmap_image_undistortion()
 
         # Export depth maps
         image_id_to_depth_path, log_tmp = self._export_depth()
@@ -125,6 +131,7 @@ class ImagesToNerfstudioDataset(ColmapConverterToNerfstudioDataset):
             image_id_to_depth_path,
             None,
             image_rename_map,
+            image_reverse_rename_map,
         )
 
         CONSOLE.log("[bold green]:tada: :tada: :tada: All DONE :tada: :tada: :tada:")

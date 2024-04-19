@@ -18,12 +18,25 @@ import math
 import re
 import shutil
 import sys
+import os
 from enum import Enum
 from pathlib import Path
 from typing import List, Literal, Optional, OrderedDict, Tuple, Union
+import random 
+import subprocess
+import multiprocessing
+import json
 
 import cv2
 import imageio
+import numpy as np
+from plyfile import PlyData, PlyElement
+from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Slerp
+from scipy.interpolate import CubicSpline
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from scipy.spatial.distance import cdist
 
 try:
     import rawpy
@@ -34,6 +47,8 @@ import numpy as np
 
 from nerfstudio.utils.rich_utils import CONSOLE, status
 from nerfstudio.utils.scripts import run_command
+from scipy.stats import norm
+
 
 POLYCAM_UPSCALING_TIMES = 2
 
@@ -178,7 +193,10 @@ def convert_video_to_images(
             start_y = crop_factor[0]
             crop_cmd = f"crop=w=iw*{width}:h=ih*{height}:x=iw*{start_x}:y=ih*{start_y},"
 
-        spacing = num_frames // num_frames_target
+        if num_frames_target == 0:
+            spacing = 1
+        else:
+            spacing = num_frames // num_frames_target
 
         downscale_chains = [f"[t{i}]scale=iw/{2**i}:ih/{2**i}[out{i}]" for i in range(num_downscales + 1)]
         downscale_dirs = [Path(str(image_dir) + (f"_{2**i}" if i > 0 else "")) for i in range(num_downscales + 1)]
@@ -219,7 +237,7 @@ def convert_video_to_images(
         CONSOLE.log("[bold green]:tada: Done converting video to images.")
 
         return summary_log, num_final_frames
-
+    
 
 def copy_images_list(
     image_paths: List[Path],
@@ -233,6 +251,7 @@ def copy_images_list(
     upscale_factor: Optional[int] = None,
     nearest_neighbor: bool = False,
     same_dimensions: bool = True,
+    rename: bool = True,
 ) -> List[Path]:
     """Copy all images in a list of Paths. Useful for filtering from a directory.
     Args:
@@ -264,7 +283,10 @@ def copy_images_list(
     for idx, image_path in enumerate(image_paths):
         if verbose:
             CONSOLE.log(f"Copying image {idx + 1} of {len(image_paths)}...")
-        copied_image_path = image_dir / f"{image_prefix}{idx + 1:05d}{image_path.suffix}"
+        if not rename:
+            copied_image_path =  image_dir
+        else:
+            copied_image_path = image_dir / f"{image_prefix}{idx + 1:05d}{image_path.suffix}"
         try:
             # if CR2 raw, we want to read raw and write RAW_CONVERTED_SUFFIX, and change the file suffix for downstream processing
             if image_path.suffix.lower() in ALLOWED_RAW_EXTS:
@@ -341,6 +363,58 @@ def copy_images_list(
 
     return copied_image_paths
 
+
+def copy_folder(
+        source_dir: Path,
+        target_dir: Path,
+):
+    shutil.copytree(source_dir.absolute(), target_dir.absolute()) 
+
+
+def empty_folder(folder_path: Path):
+    shutil.rmtree(folder_path.absolute())
+
+
+def copy_images_list_new(
+    image_paths: List[Path],
+    image_dir: Path,
+    num_downscales: int,
+    keep_image_dir: bool = False,
+) -> List[Path]:
+    """Copy all images in a list of Paths. Useful for filtering from a directory.
+    Args:
+        image_paths: List of Paths of images to copy to a new directory.
+        image_dir: Path to the output directory.
+        num_downscales: Number of times to downscale the images. Downscales by 2 each time.
+        keep_image_dir: If True, don't delete the output directory if it already exists.
+    Returns:
+        A list of the copied image Paths.
+    """
+
+    # Remove original directory and its downscaled versions
+    # only if we provide a proper image folder path and keep_image_dir is False
+    if image_dir.is_dir() and len(image_paths) and not keep_image_dir:
+        # check that output directory is not the same as input directory
+        if image_dir != image_paths[0].parent:
+            for i in range(num_downscales + 1):
+                dir_to_remove = image_dir if i == 0 else f"{image_dir}_{2**i}"
+                shutil.rmtree(dir_to_remove, ignore_errors=True)
+    image_dir.mkdir(exist_ok=True, parents=True)
+
+    copied_image_paths = []
+
+    # Images should be 1-indexed for the rest of the pipeline.
+    for idx, image_path in enumerate(image_paths):
+        copied_image_path =  image_dir
+        try:
+            shutil.copy(image_path, copied_image_path)
+        except shutil.SameFileError:
+            pass
+        copied_image_paths.append(copied_image_path)
+
+    # CONSOLE.log("[bold red]:skull: No usable images in the data folder.")
+
+    return copied_image_paths
 
 def copy_and_upscale_polycam_depth_maps_list(
     polycam_depth_image_filenames: List[Path],
@@ -684,3 +758,596 @@ def save_mask(
         cv2.imwrite(str(mask_path_i), mask_i)
     CONSOLE.log(":tada: Generated and saved masks.")
     return mask_path / "mask.png"
+
+
+def copy_image_to_subfolder(image_dir: Path, subfolder_dir: Path, image_index: list):
+    images = list(sorted(image_dir.iterdir())) # , key=lambda x: int(x.name.split(".")[0])))
+    image_paths = [images[image_index[i]] for i in range(len(image_index))]
+    copy_images_list_new(image_paths=image_paths, image_dir=subfolder_dir, num_downscales=0, keep_image_dir=True)
+
+def sample_index(chunk_length : int, num_sample_images_per_chunk : int, sample_strategy: str) -> List[int]:
+    if sample_strategy == "random":
+        index = random.sample(range(chunk_length), num_sample_images_per_chunk)
+    elif sample_strategy == "uniform":
+        assert num_sample_images_per_chunk <= chunk_length
+        index = list(range(0, chunk_length, chunk_length // num_sample_images_per_chunk)) 
+    else:
+        exit(0)
+    return index
+
+def sample_images(sample_strategy: str, num_chunks: int, num_images_per_chunk: int, overlapped_fraction: float, image_dir: Path, output_dir: Path):
+    images = list(sorted(image_dir.iterdir()))
+    num_images = len(images)
+    chunk_length = num_images // num_chunks
+    non_overlapped_chunk_length = int(num_images // (num_chunks * (1 + overlapped_fraction)))
+    overlapped_chunk_length = chunk_length - non_overlapped_chunk_length
+
+    num_sample_images_per_non_overlapped_chunk = int(float(non_overlapped_chunk_length) / float(chunk_length) * num_images_per_chunk)
+    num_sample_images_per_overlapped_chunk = num_images_per_chunk - num_sample_images_per_non_overlapped_chunk
+
+    # firstly sample non-overlapped 
+    non_overlapped_sample_index = []
+    for i in range(num_chunks):
+        index = sample_index(chunk_length=non_overlapped_chunk_length, num_sample_images_per_chunk=num_sample_images_per_non_overlapped_chunk, sample_strategy=sample_strategy)
+        index = [inx + overlapped_chunk_length // 2 + i * chunk_length for inx in index]
+        non_overlapped_sample_index.append(index)
+
+    # secondly sample overlapped 
+    overlapped_sample_index = []
+    for i in range(num_chunks+1):
+        index = sample_index(chunk_length=overlapped_chunk_length, num_sample_images_per_chunk=num_sample_images_per_overlapped_chunk, sample_strategy=sample_strategy)
+        index = [inx - overlapped_chunk_length // 2 + i * chunk_length for inx in index]
+        overlapped_sample_index.append(index)
+
+    # lastly merge overlapped and non-overlapped 
+    for i in range(num_chunks):
+        non_overlapped_index = non_overlapped_sample_index[i]
+        overlapped_index_left = overlapped_sample_index[i]
+        overlapped_index_right = overlapped_sample_index[i+1]
+        left_index = overlapped_index_left
+        right_index = overlapped_index_right
+        
+        if i == 0:
+            for j in range(len(overlapped_index_left)):
+                if overlapped_index_left[j] >= 0:
+                    break
+            left_index = overlapped_index_left[j:]
+        elif i == num_chunks - 1:
+            for j in range(len(overlapped_index_right)):
+                if overlapped_index_right[j] >= num_images:
+                    break
+            right_index = overlapped_index_right[:j] 
+        
+        index = left_index + non_overlapped_index + right_index
+        chunk_folder = output_dir.joinpath("chunk_" + str(i)).joinpath("raw")
+        copy_image_to_subfolder(image_dir=image_dir, subfolder_dir=chunk_folder, image_index=index)
+        CONSOLE.log("[bold green]:tada: Done copying video/image chunks_{}.".format(i))
+
+def resample_images():
+    return 
+
+def execute_cmd(cmd):
+    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = process.communicate()
+    return stdout,stderr
+
+def colmap_multiprocessing(image_dir : Path, parallel: Optional[bool] = True):
+    cmds = []
+    chunk_paths = list(sorted(image_dir.iterdir()))
+    for chunk_path in chunk_paths:
+        cmd = "ns-process-data images --data {} --output-dir {}".format(chunk_path.joinpath("raw").absolute(), chunk_path)
+        cmds.append(cmd)
+    if parallel:
+        CONSOLE.log("[bold green]:tada: Running colmap in parallel.")
+        pool = multiprocessing.Pool(processes=len(cmds))
+        results = pool.map(execute_cmd, cmds)
+        pool.close()
+        pool.join()
+    else:
+        CONSOLE.log("[bold green]:tada: Running colmap in tandem.")
+        results = []
+        for cmd in cmds:
+            result = os.system(command=cmd)
+            results.append((str(result).encode('utf-8'), str(result).encode('utf-8')))
+
+    CONSOLE.log("[bold green]:tada: Colmap processing has done for all video/image chunks.")
+    # for cmd, (stdout, stderr) in zip(cmds, results):
+    #    CONSOLE.log("[bold green]:tada: Command {} executed with stdout: {} and stderr: {}.".format(stdout.decode(), stderr.decode())) 
+
+
+def filter_points(data, threshold=0.9):
+    means = np.mean(data, axis=0)
+    stds = np.std(data, axis=0)
+    ranges = norm.interval(threshold, loc=means, scale=stds)
+    in_range = np.all((data >= ranges[0]) & (data <= ranges[1]), axis=1)
+    indices_in_range = np.where(in_range)[0]
+    indices_out_of_range = np.where(~in_range)[0]
+    return indices_in_range, indices_out_of_range
+
+
+
+def compute_coordinate_transform_matrix(chunk1: Path, chunk2: Path):
+    with open(chunk1.joinpath("transforms.json").absolute(), 'r') as f:
+        data1 = json.load(f)
+        frames1 = data1["frames"]
+        original_ids1 = dict(zip([frames1[i]["original_path"] for i in range(len(frames1))], [i for i in range(len(frames1))]))
+        trans1 = [frames1[i]["transform_matrix"] for i in range(len(frames1))]
+
+    with open(chunk2.joinpath("transforms.json").absolute(), 'r+') as f:
+        data2 = json.load(f)
+        frames2 = data2["frames"]
+        original_ids2 = dict(zip([frames2[i]["original_path"] for i in range(len(frames2))], [i for i in range(len(frames2))]))
+        trans2 = [frames2[i]["transform_matrix"] for i in range(len(frames2))]
+    
+        # find common ids:
+        shared_ids = []
+        for id1 in original_ids1.keys():
+            if id1 in original_ids2.keys():
+                shared_ids.append(id1)
+
+        # compute coordinate average transformation matrix
+        transitions, rotations = [], []
+        positions1, positions2 = [], []
+        untrusted_frames = []
+        
+
+        for id in shared_ids:
+            mat1 = np.array(trans1[original_ids1[id]])
+            mat2 = np.array(trans2[original_ids2[id]])
+            pos1 = mat1[:3, 3]
+            pos2 = mat2[:3, 3]
+            positions1.append(pos1)
+            positions2.append(pos2)
+        positions1 = np.array(positions1)
+        positions2 = np.array(positions2)
+        distances1 = cdist(positions1, positions1).mean()
+        distances2 = cdist(positions2, positions2).mean()
+        scale = distances2 / distances1
+        print("old distances1: ", distances1)
+        print("old distances2: ", distances2)
+        inrange, outrange = filter_points(positions1 - positions2, threshold=0.9)
+        # recompute mutual distances
+        positions1 = positions1[inrange]
+        positions2 = positions2[inrange]
+        distances1 = cdist(positions1, positions1).mean()
+        distances2 = cdist(positions2, positions2).mean()
+        scale = distances2 / distances1
+        print("new distances1: ", distances1)
+        print("new distances2: ", distances2)
+
+        for i in range(len(shared_ids)):
+            mat1 = np.array(trans1[original_ids1[shared_ids[i]]])
+            mat2 = np.array(trans2[original_ids2[shared_ids[i]]])
+            mat2[:3, 3] /= scale
+            coor_trans = np.dot(mat1, np.linalg.inv(mat2))  # 2-->1
+            transition = coor_trans[:3, 3]
+            rotation = R.from_matrix(coor_trans[:3, :3])
+            transitions.append(transition)
+            rotations.append(rotation)
+
+        transitions = [transitions[i] for i in inrange]
+        rotations = [rotations[i] for i in inrange]
+
+        for i in outrange:
+            untrusted_frames.append(shared_ids[i])
+
+        print("transitions:\n", transitions)
+        print("rotations: \n", [ori.as_euler('xyz') for ori in rotations])
+        average_transition = sum(transitions) / len(transitions)
+        average_rotation_matrix = R.mean(R.concatenate(rotations)).as_matrix()
+        average_transform_matrix = np.eye(4)
+        average_transform_matrix[:3, :3] = average_rotation_matrix
+        average_transform_matrix[:3, 3] = average_transition
+
+        data2["scale"] = scale
+        data2["coordination_transform_matrix"] = average_transform_matrix.tolist()
+        data2["precedent_chunk"] = str(chunk1.absolute())
+        f.seek(0)
+        f.truncate()
+        json.dump(data2, f, indent=4)
+        print("untrusted frames:\n", untrusted_frames)
+    return untrusted_frames
+
+
+def recursive_compute_trans_matrix(chunk_path: str):
+    with open(os.path.join(chunk_path , "transforms.json"), 'r') as f:
+        data = json.load(f)
+        if "precedent_chunk" in data.keys() and "coordination_transform_matrix" in data.keys():
+            transform_matrix = data["coordination_transform_matrix"]
+            scale = data["scale"]
+            precedent_chunk_path = data["precedent_chunk"]
+            pre_transform_matrix, pre_scale = recursive_compute_trans_matrix(precedent_chunk_path)
+            transform_matrix =  np.dot(pre_transform_matrix, transform_matrix)
+            scale =  pre_scale * scale
+        else:
+            scale = 1.0
+            transform_matrix = np.eye(4)
+        return transform_matrix, scale
+
+def merge_frames(transform_info_file: Path, output_file: Path):
+    with open(transform_info_file.absolute(),'r') as f:
+        data = json.load(f)
+        chunk_paths = data["chunk_path"]
+        transform_matrix = np.array(data["transform_matrix"])
+    frames = []
+    stamps = dict()
+    for ck_path, trans_mat in zip(chunk_paths, transform_matrix):
+        with open(os.path.join(ck_path, "transforms.json"),'r') as f:
+            data = json.load(f)
+            data_keys = list(data.keys())
+            for k in data_keys:
+                if k != "frames":
+                    data.pop(k)
+            new_frames = data["frames"]
+            for i in range(len(new_frames)):
+                global_id = new_frames[i]["original_path"]
+                if global_id in stamps:
+                    continue
+                stamps[global_id] = True
+                new_frames[i]["transform_matrix"] = np.dot(new_frames[i]["transform_matrix"], trans_mat).tolist()
+                new_frames[i]["file_path"] = new_frames[i]["original_path"]
+                new_frames[i].pop("original_path")
+                frames.append(new_frames[i])
+    with open(output_file.absolute(), 'r+') as f:
+        data = json.load(f)
+        data["frames"] = frames
+        f.seek(0)
+        f.truncate()
+        json.dump(data, f, indent=4)
+
+def merge_camera_intrinsics(chunk_paths: List[Path], output_file: Path):
+    intrinsics_key = ['w', 'h', 'fl_x', 'fl_y', 'cx', 'cy', 'k1', 'k2', 'p1', 'p2']
+    intrinsics_val = [0.0 for _ in intrinsics_key]
+    intrinsics = dict(zip(intrinsics_key, intrinsics_val))
+    for chunk_path in chunk_paths:
+        with open(os.path.join(chunk_path.absolute(), "transforms.json"), 'r') as f:
+            data = json.load(f)
+            for k in intrinsics_key:
+                intrinsics[k] += data[k]
+    for k in intrinsics.keys():
+        intrinsics[k] = intrinsics[k] / len(chunk_paths)
+    intrinsics['w'] = int(intrinsics['w'])
+    intrinsics['h'] = int(intrinsics['h'])
+    
+    with open(output_file, 'w+') as f:
+        data = dict()
+        data.update(intrinsics)
+        json.dump(data, f, indent=4)
+
+def transform_point_cloud(points, transform_matrix, scale):
+    """
+    Apply transformation matrix to the points.
+    """
+    homogeneous_points = np.hstack((points / scale, np.ones((len(points), 1))))
+    transformed_points = np.dot(homogeneous_points, transform_matrix.T)
+    transformed_points = transformed_points[:, :3]
+
+    rotation = transform_matrix[:3, :3]
+    transition = transform_matrix[:3, 3]
+    new_points = points / scale
+    rot_points = np.dot(new_points, rotation.T)
+    trt_points = rot_points + transition
+    return trt_points
+    # return transformed_points
+
+
+def create_output(positions, colors, filename):
+    colors = colors.reshape(-1, 3) 
+    positions = positions.reshape(-1,3)
+    vertices = np.hstack([positions, colors])
+    np.savetxt(filename, vertices, fmt='%f %f %f %d %d %d')  
+
+    ply_header = \
+    '''ply
+    format ascii 1.0
+    element vertex %(vert_num)d
+    property float x
+    property float y
+    property float z
+    property uint8 red
+    property uint8 green
+    property uint8 blue
+    end_header
+    '''
+    with open(filename, 'r+') as f:
+        old = f.read()
+        f.seek(0)
+        f.write(ply_header % dict(vert_num=len(vertices)))
+        f.write(old)
+
+
+def merge_ply_files(transform_info_file: Path, output_file: Path):
+    # Initialize lists to store vertices and faces
+    merged_positions, merged_colors = [], []
+    with open(transform_info_file, 'r') as f:
+        data = json.load(f)
+        transform_matrices = data["transform_matrix"]
+        scales = data["scale"]
+        chunk_parhs = data["chunk_path"]
+
+    # Iterate through input files
+    for chunk_path, transform_matrix, scale in zip(chunk_parhs, transform_matrices, scales):
+        transform_matrix = np.array(transform_matrix)
+        # Load PLY file
+        ply_data = PlyData.read(os.path.join(chunk_path, 'sparse_pc.ply'))
+
+        # Extract vertices
+        points = np.array([(vertex['x'], vertex['y'], vertex['z'], vertex['red'], vertex['green'], vertex['blue']) for vertex in ply_data['vertex']])
+
+        # Apply transformation matrix to the points
+        positions = transform_point_cloud(points[:, :3], transform_matrix, scale)
+        colors = points[:, 3:]
+        create_output(positions=positions, colors=colors, filename=os.path.join(chunk_path, 'transformed_sparse_pc.ply'))
+        merged_positions.append(positions)
+        merged_colors.append(colors)
+
+    merged_positions = np.concatenate(merged_positions)
+    merged_colors = np.concatenate(merged_colors)
+    create_output(positions=merged_positions, colors=merged_colors, filename=output_file)
+
+
+def merge_camera_model(chunk_paths: List[Path], output_file: Path):
+    camera_model = ''
+    for chunk_path in chunk_paths:
+        with open(os.path.join(chunk_path.absolute(), "transforms.json"), 'r') as f:
+            data = json.load(f)
+            if not camera_model:
+                camera_model = data['camera_model']
+            else:
+                if data['camera_model'] != camera_model:
+                    print("different camera model found!")
+                    exit(0)
+
+    with open(output_file, 'r+') as f:
+        data = json.load(f)
+        data['camera_model'] = camera_model
+        f.seek(0)
+        f.truncate()
+        json.dump(data, f, indent=4)
+
+def merge_ply_file_path(output_file: Path):
+    with open(output_file.absolute(), 'r+') as f:
+        data = json.load(f)
+        data["ply_file_path"] = "sparse_pc.ply" 
+        f.seek(0)
+        f.truncate()
+        json.dump(data, f, indent=4)    
+
+def merge_images(transform_info_file: Path, image_dir: Path, output_dir: Path, output_file: Path):
+    with open(transform_info_file, 'r') as f:
+        data = json.load(f)
+        untrusted_frames = set(data["untrusted_frames"])
+
+    chunk_paths = list(sorted(image_dir.iterdir()))
+    for chunk_path in chunk_paths:
+        images = chunk_path.joinpath("raw").iterdir()
+        images = set([im.name for im in images])
+        untrusted = images.intersection(untrusted_frames)
+        images.difference(untrusted)
+        images = list(images)
+        images_paths = [chunk_path.joinpath("raw").joinpath(im) for im in images]
+        copy_images_list_new(image_paths=images_paths, image_dir=output_dir.joinpath("images"), num_downscales=0, keep_image_dir=True)
+    
+    with open(output_file, 'r+') as f:
+        data = json.load(f)
+        frames = data["frames"]
+        images = [frame["file_path"] for frame in frames]
+        indices = []
+        for i in range(len(images)):
+            if images[i] not in untrusted_frames:
+                indices.append(i)
+        frames = [frames[i] for i in indices]
+        data["frames"] = frames
+        f.seek(0)
+        f.truncate()
+        json.dump(data, f, indent=4)
+
+        
+def merge_chunks(image_dir: Path, output_dir: Path):
+    chunk_paths = list(sorted(image_dir.iterdir()))
+    output_dir.mkdir(exist_ok=True, parents=True)
+    transform_matrices = []
+    scales = []
+    chunk_paths.sort(key=lambda x: x.absolute())
+    untrusted_frames = []
+    for i in range(len(chunk_paths)-1):
+        untrusted_frames.extend(compute_coordinate_transform_matrix(chunk_paths[i], chunk_paths[i+1]))
+    for chunk_path in chunk_paths:
+        transform_matrix, scale = recursive_compute_trans_matrix(chunk_path=str(chunk_path.absolute()))
+        transform_matrices.append(transform_matrix.tolist())
+        scales.append(scale)
+    
+    transform_info = dict()
+    transform_info["transform_matrix"] = transform_matrices
+    transform_info["scale"] = scales
+    transform_info["chunk_path"] = [str(chunk_path.absolute()) for chunk_path in chunk_paths]
+    transform_info["untrusted_frames"] = untrusted_frames
+    transform_info_file = output_dir.joinpath("transform_merge_chunks.json")
+
+    with open(transform_info_file, 'w+') as f:
+        json.dump(transform_info, f, indent=4)
+    
+    new_transforms_json_file = output_dir.joinpath("transforms.json")
+    new_ply_file = output_dir.joinpath("sparse_pc.ply")
+    merge_camera_intrinsics(chunk_paths, output_file=new_transforms_json_file)
+    merge_frames(transform_info_file=transform_info_file, output_file=new_transforms_json_file)
+    merge_camera_model(chunk_paths, output_file=new_transforms_json_file)
+    merge_ply_file_path(new_transforms_json_file)
+    merge_ply_files(transform_info_file=transform_info_file, output_file=new_ply_file)
+    merge_images(transform_info_file=transform_info_file, image_dir=image_dir, output_dir=output_dir, output_file=new_transforms_json_file)
+
+def plot_trajectory(poses):
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Extract XYZ coordinates from poses
+    xyz = np.array([[np.cos(p[1])*np.cos(p[0]), np.cos(p[1])*np.sin(p[0]), np.sin(p[1])] for p in poses[:, :3]])
+
+    # Plot trajectory
+    ax.plot(xyz[:, 0], xyz[:, 1], xyz[:, 2], marker='o', linestyle='-', color='b')
+
+    # Plot orientation at each sample point
+    for pose in poses:
+        x, y, z = np.cos(pose[1])*np.cos(pose[0]), np.cos(pose[1])*np.sin(pose[0]), np.sin(pose[1])
+        R = np.array([[np.cos(pose[2]), -np.sin(pose[2]), 0],
+                      [np.sin(pose[2]), np.cos(pose[2]), 0],
+                      [0, 0, 1]])
+        width = 0.2
+        height = 0.2
+        rect = np.array([[-width/2, width/2, width/2, -width/2],
+                         [-height/2, -height/2, height/2, height/2],
+                         [0, 0, 0, 0]])
+        rect_rotated = np.dot(R, rect)
+        ax.plot_surface(x + rect_rotated[0, :].reshape((2, 2)), 
+                        y + rect_rotated[1, :].reshape((2, 2)), 
+                        z + rect_rotated[2, :].reshape((2, 2)),
+                        color='red', alpha=0.5)
+
+    ax.set_xlabel('X Axis')
+    ax.set_ylabel('Y Axis')
+    ax.set_zlabel('Z Axis')
+    ax.set_title('Interpolated Trajectory')
+    plt.show()
+
+def pose_interpolation(image_dir: Path, merged_dir: Path, output_dir: Path):
+    merged_file = merged_dir.joinpath("transforms.json")
+    output_file = output_dir.joinpath("transforms_interpolation.json")
+
+    images = list(sorted(image_dir.iterdir()))
+    images = [im.name for im in images]
+    stamps = np.linspace(0, len(images) // 5, len(images))
+    index = dict(zip(images, list(stamps)))
+
+    with open(merged_file, 'r') as f:
+        data = json.load(f)
+    sampled_frames = data['frames']
+    sampled_frames.sort(key=lambda x: x['file_path'])
+    sampled_stamps = np.array([index[f['file_path']] for f in sampled_frames])
+
+    # pop images that are out of the range of sampled stamps
+    for i in range(len(images)):
+        if images[i] == sampled_frames[0]['file_path']:
+            break 
+    for j in reversed(range(len(images))):
+        if images[j] == sampled_frames[-1]['file_path']:
+            break
+    images = images[i:j+1]
+    stamps = stamps[i:j+1]
+    index = dict(zip(images, list(stamps)))
+
+    
+    positions = []
+    rotations = []
+    for frame in sampled_frames:
+        transform_matrix = np.array(frame['transform_matrix'])
+        position = transform_matrix[:3, 3]
+        rotation = R.from_matrix(transform_matrix[:3, :3])
+        positions.append(position)
+        rotations.append(rotation)
+    positions = np.array(positions)
+    rotations = R.concatenate(rotations)
+
+    # interpolate positions and orientations separately
+    spline_position = CubicSpline(sampled_stamps, positions.T, axis=1)
+    slerp = Slerp(sampled_stamps.tolist(), rotations)
+
+    position_mse = np.mean(np.linalg.norm(spline_position(sampled_stamps).T - positions, axis=1)**2)
+    orientation_mse = np.mean(np.linalg.norm(slerp(sampled_stamps.tolist()).as_euler('xyz') - rotations.as_euler('xyz'), axis=1)**2)
+    CONSOLE.log("[bold green]:tada: Position interpolation error is {}.".format(position_mse))
+    CONSOLE.log("[bold green]:tada: Orientation interpolation error is {}.".format(orientation_mse))
+
+    # Compute interpolated transform matrix for unsampled images
+    interpolated_positions = spline_position(stamps)
+    interpolated_orientations = slerp(stamps.tolist())
+    # interpolated_poses = np.concatenate((interpolated_positions.T, interpolated_orientations.T), axis=1)
+    # # plot_trajectory(interpolated_poses)
+
+    rotations = interpolated_orientations.as_matrix()
+    positions = [np.array(position) for position in interpolated_positions.T.tolist()]
+
+    transform_matrices = []
+    for position, rotation in zip(positions, rotations):
+        transform_matrix = np.eye(4)
+        transform_matrix[:3, 3] = position  
+        transform_matrix[:3, :3] = rotation  
+        transform_matrices.append(transform_matrix.tolist())
+
+    with open(output_file, 'w') as f:
+        data = dict()
+        data["file_path"] = [str(im) for im in images]
+        data["transform_matrix"] =transform_matrices
+        json.dump(data, f, indent=4)
+
+
+def undistorting_images(image_dir: Path, output_dir: Path, many_chunks: bool=False):
+    output_dir.mkdir(exist_ok=True, parents=True)
+    empty_folder(output_dir)
+    if many_chunks:
+        chunk_paths = image_dir.iterdir()
+        for chunk_path in chunk_paths:
+            chunk_name = chunk_path.name
+            chunk_dir = output_dir.joinpath(chunk_name)
+            chunk_dir.mkdir(exist_ok=True, parents=True)
+            input_dir = chunk_dir.joinpath("input")
+            distorted_dir = chunk_dir.joinpath("distorted")
+            input_dir.mkdir(exist_ok=True, parents=True)
+            distorted_dir.mkdir(exist_ok=True, parents=True)
+            copy_folder(chunk_path.joinpath("images"), input_dir)
+            copy_folder(chunk_path.joinpath("colmap"), distorted_dir)
+    else:
+        input_dir = output_dir.joinpath("input")
+        distorted_dir = output_dir.joinpath("distorted")
+        input_dir.mkdir(exist_ok=True, parents=True)
+        distorted_dir.mkdir(exist_ok=True, parents=True)
+        copy_folder(image_dir.joinpath("images"), input_dir)
+        copy_folder(image_dir.joinpath("colmap"), distorted_dir)
+
+
+def grid_allocation(grid_size : float, image_dir: Path, merged_dir: Path, output_dir: Path, sampled: bool):
+    if sampled:
+        json_file = merged_dir.joinpath("transforms.json").absolute()
+    else:
+        json_file = merged_dir.joinpath("transforms_interpolation.json").absolute()
+    with open(json_file, 'r') as f:
+        data = json.load(f)
+        if sampled:
+            frames = [fm['file_path'] for fm in data["frames"]]
+            transformation_matrices = [fm["transform_matrix"] for fm in data["frames"]]
+        else:
+            frames = data['file_path']
+            transformation_matrices = data["transform_matrix"]
+        # allocating grid ids according to their poses
+        if "grid_id" in frames:
+            CONSOLE.log("[bold red]:tada: Each images has already been allocated a grid ID. Re-allocating grid ID......")
+        grid_ids = []
+        
+        for transform_matrix in transformation_matrices:
+            pose_position = np.dot(transform_matrix, [0, 0, 0, 1])[:3]
+            grid_x = int(pose_position[0] / grid_size)
+            grid_y = int(pose_position[1] / grid_size)
+            grid_ids.append("{}_{}".format(grid_x, grid_y))
+        
+    # copy images to their corresponding directories
+    unique_grid_ids = list(set(grid_ids))
+    if sampled:
+        output_dirs = dict(zip(unique_grid_ids, [output_dir.joinpath("grid_{}".format(gid)).joinpath("sampled").absolute() for gid in unique_grid_ids]))
+    else:
+        output_dirs = dict(zip(unique_grid_ids, [output_dir.joinpath("grid_{}".format(gid)).joinpath("original").absolute() for gid in unique_grid_ids]))
+    
+    image_paths = dict(zip(unique_grid_ids, [[] for _ in unique_grid_ids]))
+    for grid_id, image in zip(grid_ids, frames):
+        image_paths[grid_id].append(image_dir.joinpath(image))
+    
+    for grid_id in unique_grid_ids:
+        copy_images_list_new(image_paths=image_paths[grid_id], image_dir=output_dirs[grid_id], num_downscales=0, keep_image_dir=True)
+    CONSOLE.log("[bold green]:tada: Successfully copied images to their corresponding blocks.")
+
+        
+
+
+    
+
+
+
+
+
