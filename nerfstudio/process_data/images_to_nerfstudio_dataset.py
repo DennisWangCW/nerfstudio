@@ -16,7 +16,7 @@
 
 from dataclasses import dataclass
 from typing import Optional
-
+import json 
 from nerfstudio.process_data import equirect_utils, process_data_utils
 from nerfstudio.process_data.colmap_converter_to_nerfstudio_dataset import ColmapConverterToNerfstudioDataset
 from nerfstudio.utils.rich_utils import CONSOLE
@@ -92,6 +92,9 @@ class ImagesToNerfstudioDataset(ColmapConverterToNerfstudioDataset):
             num_frames = len(image_rename_map)
             summary_log.append(f"Starting with {num_frames} images")
 
+            with open(self.image_dir.parent.joinpath("image_reverse_rename_map.json"), "w") as json_file:
+                json.dump(image_reverse_rename_map, json_file, indent=4)
+
             # # Create mask
             mask_path = process_data_utils.save_mask(
                 image_dir=self.image_dir,
@@ -108,15 +111,21 @@ class ImagesToNerfstudioDataset(ColmapConverterToNerfstudioDataset):
             summary_log.append(f"Starting with {num_frames} images")
 
         # Run COLMAP
-        # print("image map:\n", image_rename_map)
-        # print("image reverse map:\n", image_reverse_rename_map)
         if not self.skip_colmap:
             require_cameras_exist = True
             self._run_colmap()
             # Colmap uses renamed images
             image_rename_map = None
+        
+        if self.image_dir.parent.joinpath("image_reverse_rename_map.json").exists():
+            CONSOLE.log("[bold green]:tada: Skip image processing, load image_reverse_rename_map from file!")
+            image_rename_map = None 
+            image_reverse_rename_map = None 
+            with open(self.image_dir.parent.joinpath("image_reverse_rename_map.json"), "r") as f:
+                image_reverse_rename_map = json.load(f)
+
         if self.undistorted:
-            process_data_utils.undistorting_images(image_dir=self.image_dir, output_dir=self.undistorted_dir)
+            process_data_utils.undistorting_images(output_dir=self.output_dir)
             self._run_colmap_image_undistortion()
 
         # Export depth maps

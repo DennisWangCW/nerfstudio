@@ -44,6 +44,10 @@ class BaseConverterToNerfstudioDataset(ABC):
         return self.output_dir / "images"
     
     @property
+    def distorted_dir(self) -> Path:
+        return self.output_dir / "distorted"
+    
+    @property
     def sample_dir(self) -> Path:
         return self.output_dir / "samples"
     

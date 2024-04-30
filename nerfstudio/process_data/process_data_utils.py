@@ -49,7 +49,6 @@ from nerfstudio.utils.rich_utils import CONSOLE, status
 from nerfstudio.utils.scripts import run_command
 from scipy.stats import norm
 
-
 POLYCAM_UPSCALING_TIMES = 2
 
 """Lowercase suffixes to treat as raw image."""
@@ -380,6 +379,7 @@ def copy_images_list_new(
     image_dir: Path,
     num_downscales: int,
     keep_image_dir: bool = False,
+    rename_mapper: Optional[dict] = None,
 ) -> List[Path]:
     """Copy all images in a list of Paths. Useful for filtering from a directory.
     Args:
@@ -405,7 +405,10 @@ def copy_images_list_new(
 
     # Images should be 1-indexed for the rest of the pipeline.
     for idx, image_path in enumerate(image_paths):
-        copied_image_path =  image_dir
+        if rename_mapper == None:
+            copied_image_path =  image_dir
+        else:
+            copied_image_path = image_dir.joinpath(rename_mapper[image_path.name])
         try:
             shutil.copy(image_path, copied_image_path)
         except shutil.SameFileError:
@@ -819,7 +822,7 @@ def sample_images(sample_strategy: str, num_chunks: int, num_images_per_chunk: i
             right_index = overlapped_index_right[:j] 
         
         index = left_index + non_overlapped_index + right_index
-        chunk_folder = output_dir.joinpath("chunk_" + str(i)).joinpath("raw")
+        chunk_folder = output_dir.joinpath("chunk_" + str(i)).joinpath("images")
         copy_image_to_subfolder(image_dir=image_dir, subfolder_dir=chunk_folder, image_index=index)
         CONSOLE.log("[bold green]:tada: Done copying video/image chunks_{}.".format(i))
 
@@ -831,12 +834,20 @@ def execute_cmd(cmd):
     stdout, stderr = process.communicate()
     return stdout,stderr
 
-def colmap_multiprocessing(image_dir : Path, parallel: Optional[bool] = True):
+def colmap_multiprocessing(image_dir : Path, output_dir: Path, parallel: Optional[bool] = True, undistorted: Optional[bool] = True, skip_colmap: Optional[bool] = True, skip_image_processing: Optional[bool] = True):
     cmds = []
     chunk_paths = list(sorted(image_dir.iterdir()))
     for chunk_path in chunk_paths:
-        cmd = "ns-process-data images --data {} --output-dir {}".format(chunk_path.joinpath("raw").absolute(), chunk_path)
+        cmd = "ns-process-data images --data {}".format(chunk_path.joinpath("images").absolute())
+        cmd += " --output-dir {}".format(output_dir.joinpath(chunk_path.name).absolute())
+        if undistorted:
+            cmd += " --undistorted"
+        if skip_colmap:
+            cmd += " --skip-colmap"
+        if skip_image_processing:
+            cmd += "  --skip-image-processing"
         cmds.append(cmd)
+    print("Multiprocessing CMD:\n", cmds)
     if parallel:
         CONSOLE.log("[bold green]:tada: Running colmap in parallel.")
         pool = multiprocessing.Pool(processes=len(cmds))
@@ -854,6 +865,11 @@ def colmap_multiprocessing(image_dir : Path, parallel: Optional[bool] = True):
     # for cmd, (stdout, stderr) in zip(cmds, results):
     #    CONSOLE.log("[bold green]:tada: Command {} executed with stdout: {} and stderr: {}.".format(stdout.decode(), stderr.decode())) 
 
+def colmap_undistortion_multiprocessing(image_dir: Path):
+    chunk_paths = list(sorted(image_dir.iterdir()))
+    for chunk_path in chunk_paths:
+        cmd = "ns-process-data images --data {}".format(chunk_path.absolute())
+        cmd += " --skip-colmap --undistorted"
 
 def filter_points(data, threshold=0.9):
     means = np.mean(data, axis=0)
@@ -964,7 +980,7 @@ def recursive_compute_trans_matrix(chunk_path: Path):
             transform_matrix = np.eye(4)
         return transform_matrix, scale
 
-def merge_frames(transform_info_file: Path, output_file: Path):
+def merge_extrinsics(transform_info_file: Path, output_file: Path):
     with open(transform_info_file.absolute(),'r') as f:
         data = json.load(f)
         chunk_paths = data["chunk_path"]
@@ -972,6 +988,7 @@ def merge_frames(transform_info_file: Path, output_file: Path):
         transform_matrix = np.array(data["transform_matrix"])
     frames = []
     stamps = dict()
+    colmap_im_id = 0 # reallocating colmap_im_id from index 0
     for ck_path, trans_mat in zip(chunk_paths, transform_matrix):
         with open(ck_path.joinpath("transforms.json"),'r') as f:
             data = json.load(f)
@@ -986,8 +1003,10 @@ def merge_frames(transform_info_file: Path, output_file: Path):
                     continue
                 stamps[global_id] = True
                 new_frames[i]["transform_matrix"] = np.dot(new_frames[i]["transform_matrix"], trans_mat).tolist()
-                new_frames[i]["file_path"] = new_frames[i]["original_path"]
+                new_frames[i]["file_path"] = "images/" + new_frames[i]["original_path"] # TODO: check whether require prefix "images/"
                 new_frames[i].pop("original_path")
+                new_frames[i]["colmap_im_id"] = colmap_im_id
+                colmap_im_id += 1
                 frames.append(new_frames[i])
     with open(output_file.absolute(), 'r+') as f:
         data = json.load(f)
@@ -996,7 +1015,25 @@ def merge_frames(transform_info_file: Path, output_file: Path):
         f.truncate()
         json.dump(data, f, indent=4)
 
-def merge_camera_intrinsics(chunk_paths: List[Path], output_file: Path):
+def merge_intrinsics(chunk_paths: List[Path], output_file: Path):
+    camera_model = ''
+    for chunk_path in chunk_paths:
+        with open(chunk_path.joinpath("transforms.json"), 'r') as f:
+            data = json.load(f)
+            if not camera_model:
+                camera_model = data['camera_model']
+            else:
+                if data['camera_model'] != camera_model:
+                    print("different camera model found!")
+                    exit(0)
+
+    with open(output_file, 'r+') as f:
+        data = json.load(f)
+        data['camera_model'] = camera_model
+        f.seek(0)
+        f.truncate()
+        json.dump(data, f, indent=4)
+
     intrinsics_key = ['w', 'h', 'fl_x', 'fl_y', 'cx', 'cy', 'k1', 'k2', 'p1', 'p2']
     intrinsics_val = [0.0 for _ in intrinsics_key]
     intrinsics = dict(zip(intrinsics_key, intrinsics_val))
@@ -1005,10 +1042,17 @@ def merge_camera_intrinsics(chunk_paths: List[Path], output_file: Path):
             data = json.load(f)
             for k in intrinsics_key:
                 intrinsics[k] += data[k]
+            camera_model = data["camera_model"]
     for k in intrinsics.keys():
         intrinsics[k] = intrinsics[k] / len(chunk_paths)
     intrinsics['w'] = int(intrinsics['w'])
     intrinsics['h'] = int(intrinsics['h'])
+    assert camera_model == "PINHOLE" or camera_model == "OPENCV", "unsupported camera model found when merging chunks!"
+    if camera_model == "PINHOLE":
+        intrinsics.pop("k1")
+        intrinsics.pop("k2")
+        intrinsics.pop("p1")
+        intrinsics.pop("p2")
     
     with open(output_file, 'w+') as f:
         data = dict()
@@ -1031,22 +1075,23 @@ def create_output(positions, colors, filename):
     vertices = np.hstack([positions, colors])
     np.savetxt(filename, vertices, fmt='%f %f %f %d %d %d')  
 
-    ply_header = \
-    '''ply
-    format ascii 1.0
-    element vertex %(vert_num)d
-    property float x
-    property float y
-    property float z
-    property uint8 red
-    property uint8 green
-    property uint8 blue
-    end_header
-    '''
+    ply_header = []
+    ply_header.append(f"ply\n")
+    ply_header.append(f"format ascii 1.0\n")
+    ply_header.append(f"element vertex {len(vertices)}\n")
+    ply_header.append(f"property float x\n")
+    ply_header.append(f"property float y\n")
+    ply_header.append(f"property float z\n")
+    ply_header.append("property uint8 red\n")
+    ply_header.append(f"property uint8 green\n")
+    ply_header.append("property uint8 blue\n")
+    ply_header.append(f"end_header\n")
+    
     with open(filename, 'r+') as f:
         old = f.read()
         f.seek(0)
-        f.write(ply_header % dict(vert_num=len(vertices)))
+        for line in ply_header:
+            f.write(line)
         f.write(old)
 
 
@@ -1071,7 +1116,14 @@ def recursive_transform(chunk_path: Path, positions, colors):
             return positions, colors
 
 
-def merge_ply_files(transform_info_file: Path, output_file: Path):
+def merge_sparse_ply(transform_info_file: Path, transform_file: Path, output_file: Path):
+    with open(transform_file.absolute(), 'r+') as f:
+        data = json.load(f)
+        data["ply_file_path"] = "sparse_pc.ply" 
+        f.seek(0)
+        f.truncate()
+        json.dump(data, f, indent=4)    
+
     with open(transform_info_file, 'r') as f:
         data = json.load(f)
         chunk_paths = data["chunk_path"]
@@ -1088,48 +1140,28 @@ def merge_ply_files(transform_info_file: Path, output_file: Path):
     merged_colors = np.concatenate(merged_colors)
     create_output(positions=merged_positions, colors=merged_colors, filename=output_file)
 
-
-def merge_camera_model(chunk_paths: List[Path], output_file: Path):
-    camera_model = ''
-    for chunk_path in chunk_paths:
-        with open(chunk_path.joinpath("transforms.json"), 'r') as f:
-            data = json.load(f)
-            if not camera_model:
-                camera_model = data['camera_model']
-            else:
-                if data['camera_model'] != camera_model:
-                    print("different camera model found!")
-                    exit(0)
-
-    with open(output_file, 'r+') as f:
-        data = json.load(f)
-        data['camera_model'] = camera_model
-        f.seek(0)
-        f.truncate()
-        json.dump(data, f, indent=4)
-
-def merge_ply_file_path(output_file: Path):
-    with open(output_file.absolute(), 'r+') as f:
-        data = json.load(f)
-        data["ply_file_path"] = "sparse_pc.ply" 
-        f.seek(0)
-        f.truncate()
-        json.dump(data, f, indent=4)    
-
 def merge_images(transform_info_file: Path, image_dir: Path, output_dir: Path, output_file: Path):
     with open(transform_info_file, 'r') as f:
         data = json.load(f)
         untrusted_frames = set(data["untrusted_frames"])
+        chunk_paths = data["chunk_path"]
+        chunk_paths = [Path(chunk_path) for chunk_path in chunk_paths]
 
-    chunk_paths = list(sorted(image_dir.iterdir()))
     for chunk_path in chunk_paths:
-        images = chunk_path.joinpath("raw").iterdir()
+        with open(chunk_path.joinpath("transforms.json"), 'r') as f:
+            data = json.load(f)
+            frames = data["frames"]
+        file_path = [os.path.split(fm["file_path"])[-1] for fm in frames]
+        original_path = [fm["original_path"] for fm in frames]
+        rename_mapper = dict(zip(file_path, original_path))
+        image_path = chunk_path.joinpath("images")
+        images = image_path.iterdir()
         images = set([im.name for im in images])
         untrusted = images.intersection(untrusted_frames)
         images.difference(untrusted)
         images = list(images)
-        images_paths = [chunk_path.joinpath("raw").joinpath(im) for im in images]
-        copy_images_list_new(image_paths=images_paths, image_dir=output_dir.joinpath("images"), num_downscales=0, keep_image_dir=True)
+        images_paths = [image_path.joinpath(im) for im in images]
+        copy_images_list_new(image_paths=images_paths, image_dir=output_dir.joinpath("images"), num_downscales=0, keep_image_dir=True, rename_mapper=rename_mapper)
     
     with open(output_file, 'r+') as f:
         data = json.load(f)
@@ -1172,12 +1204,9 @@ def merge_chunks(image_dir: Path, output_dir: Path):
     
     new_transforms_json_file = output_dir.joinpath("transforms.json")
     new_ply_file = output_dir.joinpath("sparse_pc.ply")
-    recursive_ply_file = output_dir.joinpath("recursive_sparse.ply")
-    merge_camera_intrinsics(chunk_paths, output_file=new_transforms_json_file)
-    merge_frames(transform_info_file=transform_info_file, output_file=new_transforms_json_file)
-    merge_camera_model(chunk_paths, output_file=new_transforms_json_file)
-    merge_ply_file_path(new_transforms_json_file)
-    merge_ply_files(transform_info_file=transform_info_file, output_file=new_ply_file)
+    merge_intrinsics(chunk_paths, output_file=new_transforms_json_file)
+    merge_extrinsics(transform_info_file=transform_info_file, output_file=new_transforms_json_file)
+    merge_sparse_ply(transform_info_file=transform_info_file, transform_file=new_transforms_json_file, output_file=new_ply_file)
     merge_images(transform_info_file=transform_info_file, image_dir=image_dir, output_dir=output_dir, output_file=new_transforms_json_file)
 
 def plot_trajectory(poses):
@@ -1283,28 +1312,20 @@ def pose_interpolation(image_dir: Path, merged_dir: Path, output_dir: Path):
         json.dump(data, f, indent=4)
 
 
-def undistorting_images(image_dir: Path, output_dir: Path, many_chunks: bool=False):
-    output_dir.mkdir(exist_ok=True, parents=True)
-    empty_folder(output_dir)
-    if many_chunks:
-        chunk_paths = image_dir.iterdir()
-        for chunk_path in chunk_paths:
-            chunk_name = chunk_path.name
-            chunk_dir = output_dir.joinpath(chunk_name)
-            chunk_dir.mkdir(exist_ok=True, parents=True)
-            input_dir = chunk_dir.joinpath("input")
-            distorted_dir = chunk_dir.joinpath("distorted")
-            input_dir.mkdir(exist_ok=True, parents=True)
-            distorted_dir.mkdir(exist_ok=True, parents=True)
-            copy_folder(chunk_path.joinpath("images"), input_dir)
-            copy_folder(chunk_path.joinpath("colmap"), distorted_dir)
-    else:
-        input_dir = output_dir.joinpath("input")
-        distorted_dir = output_dir.joinpath("distorted")
-        input_dir.mkdir(exist_ok=True, parents=True)
-        distorted_dir.mkdir(exist_ok=True, parents=True)
-        copy_folder(image_dir.joinpath("images"), input_dir)
-        copy_folder(image_dir.joinpath("colmap"), distorted_dir)
+# def undistorting_images(image_dir: Path, output_dir: Path):
+def undistorting_images(output_dir: Path):
+    # input_dir = output_dir.joinpath("input")
+    # distorted_dir = output_dir.joinpath("distorted")
+    # copy_folder(image_dir.joinpath("images"), input_dir)
+    # copy_folder(output_dir.joinpath("colmap"), distorted_dir)
+    # empty_folder(output_dir.joinpath("images"))
+    # empty_folder(output_dir.joinpath("colmap"))
+    input_dir = output_dir.joinpath("input")
+    distorted_dir = output_dir.joinpath("distorted")
+    copy_folder(output_dir.joinpath("images"), input_dir)
+    copy_folder(output_dir.joinpath("colmap"), distorted_dir)
+    empty_folder(output_dir.joinpath("images"))
+    empty_folder(output_dir.joinpath("colmap"))
 
 
 def grid_allocation(grid_size : float, image_dir: Path, merged_dir: Path, output_dir: Path, sampled: bool):
@@ -1347,10 +1368,6 @@ def grid_allocation(grid_size : float, image_dir: Path, merged_dir: Path, output
     CONSOLE.log("[bold green]:tada: Successfully copied images to their corresponding blocks.")
 
         
-
-
-    
-
 
 
 

@@ -46,7 +46,7 @@ class VideoToNerfstudioDataset(ColmapConverterToNerfstudioDataset):
         """Process video into a nerfstudio dataset."""
         summary_log = []
         summary_log_eval = []
-        if not self.skip_processing_video:    
+        if not self.skip_video_processing:    
             # Convert video to images
             if self.camera_type == "equirectangular":
                 # create temp images folder to store the equirect and perspective images
@@ -130,42 +130,49 @@ class VideoToNerfstudioDataset(ColmapConverterToNerfstudioDataset):
                 summary_log.append(f"Saved mask to {mask_path}")
         
         if self.get_full_images:
-            if not self.skip_processing_video:
+            if not self.skip_video_processing:
                 process_data_utils.sample_images(sample_strategy=self.chunk_image_sample_strategy, 
                                                 num_chunks=self.num_overlapped_chunks, 
                                                 overlapped_fraction=self.overlapped_fraction,
                                                 num_images_per_chunk=self.target_frames_per_chunk, 
                                                 image_dir=self.image_dir, output_dir=self.sample_dir)
-            
             CONSOLE.log("[bold green]:tada: Done generating video/image chunks!")
+
             if not self.skip_colmap:
-                process_data_utils.colmap_multiprocessing(image_dir=self.sample_dir, parallel=self.parallel_colmap)
-                CONSOLE.log("[bold green]:tada: Done Extracting colmap positions for each chunk!")
-            if self.undistorted:
-                process_data_utils.undistorting_images(image_dir=self.sample_dir, output_dir=self.undistorted_dir, many_chunks=True)
-                self._run_colmap_image_undistortion(many_chunks=True)
+                if self.undistorted:
+                    process_data_utils.colmap_multiprocessing(image_dir=self.sample_dir, output_dir=self.undistorted_dir, parallel=self.parallel_colmap, undistorted=self.undistorted, skip_colmap=self.skip_colmap, skip_image_processing=self.skip_video_processing)
+                    CONSOLE.log("[bold green]:tada: Done Colmap processing for each chunk! Images are undistorted version!")
+                else:
+                    process_data_utils.colmap_multiprocessing(image_dir=self.sample_dir, output_dir=self.distorted_dir, parallel=self.parallel_colmap, undistorted=self.undistorted, skip_colmap=self.skip_colmap, skip_image_processing=self.skip_video_processing)
+                    CONSOLE.log("[bold green]:tada: Done Colmap processing for each chunk! Images are distorted version!")
+            # if self.undistorted:
+            #     # process_data_utils.undistorting_images(image_dir=self.sample_dir, output_dir=self.undistorted_dir, num_overlapped_chunks=self.num_overlapped_chunks)
+            #     chunk_paths = self.undistorted_dir.iterdir()
+            #     for chunk_path in chunk_paths:
+            #         self._run_colmap_image_undistortion()
+                # process_data_utils.colmap_undistortion_multiprocessing(image_dir=self.undistorted_dir)
                 CONSOLE.log("[bold green]:tada: Done undistorting all images!")
-            process_data_utils.merge_chunks(image_dir=self.sample_dir if not self.undistorted else self.undistorted_dir, output_dir=self.merge_dir)
+            process_data_utils.merge_chunks(image_dir=self.distorted_dir if not self.undistorted else self.undistorted_dir, output_dir=self.merge_dir)
             CONSOLE.log("[bold green]:tada: Done merging all video/image chunks!")
+            self._run_json_and_ply_to_colmap(self.merge_dir)
 
             # process_data_utils.pose_interpolation(image_dir=self.image_dir, merged_dir=self.merge_dir, output_dir=self.merge_dir)
             # process_data_utils.grid_allocation(grid_size=self.grid_size,image_dir=self.image_dir, merged_dir=self.merge_dir, output_dir=self.grid_dir, sampled=False)
-            return
+        else:
+            # Run Colmap
+            if not self.skip_colmap:
+                self._run_colmap(mask_path)
+            if self.undistorted:
+                process_data_utils.undistorting_images(output_dir=self.undistorted_dir)
+                self._run_colmap_image_undistortion()
 
-        # Run Colmap
-        if not self.skip_colmap:
-            self._run_colmap(mask_path)
-        if self.undistorted:
-            process_data_utils.undistorting_images(image_dir=self.image_dir, output_dir=self.undistorted_dir)
-            self._run_colmap_image_undistortion()
+            # Export depth maps
+            image_id_to_depth_path, log_tmp = self._export_depth()
+            summary_log += log_tmp
 
-        # Export depth maps
-        image_id_to_depth_path, log_tmp = self._export_depth()
-        summary_log += log_tmp
+            summary_log += self._save_transforms(num_extracted_frames, image_id_to_depth_path, mask_path)
 
-        summary_log += self._save_transforms(num_extracted_frames, image_id_to_depth_path, mask_path)
+            CONSOLE.log("[bold green]:tada: :tada: :tada: All DONE :tada: :tada: :tada:")
 
-        CONSOLE.log("[bold green]:tada: :tada: :tada: All DONE :tada: :tada: :tada:")
-
-        for summary in summary_log:
-            CONSOLE.log(summary)
+            for summary in summary_log:
+                CONSOLE.log(summary)

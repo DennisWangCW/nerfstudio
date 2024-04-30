@@ -12,7 +12,7 @@ def colmap_multiprocessing(image_dir : Path, parallel: bool = True):
     cmds = []
     chunk_paths = list(sorted(image_dir.iterdir()))
     for chunk_path in chunk_paths:
-        cmd = "ns-process-data images --data {} --output-dir {}".format(chunk_path.joinpath("raw").absolute(), "./tmp")
+        cmd = "ns-process-data images --data {} --output-dir {}".format(chunk_path.absolute(), "./tmp")
         cmds.append(cmd)
     if parallel:
         print("[bold green]:tada: Running colmap in parallel.")

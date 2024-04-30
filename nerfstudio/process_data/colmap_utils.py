@@ -25,7 +25,11 @@ import numpy as np
 import requests
 import torch
 from packaging.version import Version
+import shutil
 from rich.progress import track
+from scipy.spatial.transform import Rotation as R
+import collections
+from plyfile import PlyData
 
 # TODO(1480) use pycolmap instead of colmap_parsing_utils
 # import pycolmap
@@ -35,12 +39,23 @@ from nerfstudio.data.utils.colmap_parsing_utils import (
     read_images_binary,
     read_points3D_binary,
     read_points3D_text,
+    write_cameras_binary,
+    write_cameras_text,
+    write_images_binary,
+    write_images_text,
+    write_points3D_binary,
+    write_points3D_text,
 )
 from nerfstudio.process_data.process_data_utils import CameraModel
 from nerfstudio.utils import colormaps
 from nerfstudio.utils.rich_utils import CONSOLE, status
 from nerfstudio.utils.scripts import run_command
 import subprocess
+
+from nerfstudio.data.utils.colmap_parsing_utils import Camera, Image, Point3D
+# Camera = collections.namedtuple("Camera", ["id", "model", "width", "height", "params"])
+# BaseImage = collections.namedtuple("Image", ["id", "qvec", "tvec", "camera_id", "name", "xys", "point3D_ids"])
+# Point3D = collections.namedtuple("Point3D", ["id", "xyz", "rgb", "error", "image_ids", "point2D_idxs"])
 
 
 def get_available_gpus():
@@ -104,7 +119,7 @@ def run_colmap_image_undistortion(
 ) -> None:
     img_undist_cmd = [f"{colmap_cmd} image_undistorter",
         f"--image_path {image_dir / 'input'}",
-        f"--input_path {image_dir / 'distorted' / 'sparse' /' 0'}",
+        f"--input_path {image_dir / 'distorted/sparse/0'}",
         f"--output_path {image_dir}",
         f"--output_type COLMAP"]
     img_undist_cmd = " ".join(img_undist_cmd)
@@ -118,9 +133,15 @@ def run_colmap_image_undistortion(
     for file in sparse_path.iterdir():
         if file.name == '0':
             continue
-        source_file = sparse_path.joinpath(file)
-        destination_file = sparse_path.joinpath("0").joinpath(file)
+        source_file = sparse_path.joinpath(file.name)
+        destination_file = sparse_path.joinpath("0").joinpath(file.name)
         source_file.replace(destination_file)
+    colmap_dir = image_dir.joinpath("colmap").joinpath("sparse")
+    shutil.copytree(sparse_path.absolute(), colmap_dir.absolute())
+    shutil.rmtree(sparse_path.absolute())
+    shutil.rmtree(image_dir.joinpath("input"))
+    shutil.rmtree(image_dir.joinpath("distorted"))
+
 
 def run_colmap(
     image_dir: Path,
@@ -259,11 +280,11 @@ def parse_colmap_camera_params(camera) -> Dict[str, Any]:
         out["fl_y"] = float(camera_params[1])
         out["cx"] = float(camera_params[2])
         out["cy"] = float(camera_params[3])
-        out["k1"] = 0.0
-        out["k2"] = 0.0
-        out["p1"] = 0.0
-        out["p2"] = 0.0
-        camera_model = CameraModel.OPENCV
+        # out["k1"] = 0.0
+        # out["k2"] = 0.0
+        # out["p1"] = 0.0
+        # out["p2"] = 0.0
+        camera_model = CameraModel.PINHOLE
     elif camera.model == "SIMPLE_RADIAL":
         # f, cx, cy, k
 
@@ -454,7 +475,10 @@ def colmap_to_json(
     Returns:
         The number of registered images.
     """
-
+    print("checking paths: \n")
+    print("camera_mask_path: ", camera_mask_path)
+    print("image_id_to_depth_path: ", image_id_to_depth_path)
+    print("keep_original_world_coordinate: ", keep_original_world_coordinate)
     # TODO(1480) use pycolmap
     # recon = pycolmap.Reconstruction(recon_dir)
     # cam_id_to_camera = recon.cameras
@@ -493,7 +517,7 @@ def colmap_to_json(
             "file_path": name.as_posix(),
             "original_path":  image_reverse_rename_map[original_name] if image_reverse_rename_map is not None else "",
             "transform_matrix": c2w.tolist(),
-            # "colmap_im_id": im_id,
+            "colmap_im_id": im_id,
         }
         if camera_mask_path is not None:
             frame["mask_path"] = camera_mask_path.relative_to(camera_mask_path.parent.parent).as_posix()
@@ -528,6 +552,117 @@ def colmap_to_json(
         json.dump(out, f, indent=4)
 
     return len(frames)
+
+
+def json_to_colmap(json_file: Path, output_dir: Path, keep_original_world_coordinate: Optional[bool] = False) -> None:
+    with open(json_file, 'r') as f:
+        data = json.load(f)
+    
+    #### preparing data for cameras.txt
+    w = data["w"]
+    h = data["h"]
+    fl_x = data["fl_x"]
+    fl_y = data["fl_y"]
+    cx = data["cx"]
+    cy = data["cy"]
+    k1 = data["k1"]
+    k2 = data["k2"]
+    p1 = data["p1"]
+    p2 = data["p2"]
+    params = [fl_x, fl_y, cx, cy, k1, k2, p1, p2]
+    camera_model = data["camera_model"]
+    camera_id = 1
+
+    cameras = {}
+    cameras[camera_id] = Camera(
+                id=camera_id, model=camera_model, width=w, height=h, params=np.array(params)
+            )    
+    camera_filename_txt = output_dir.joinpath("cameras.txt")
+    camera_filename_bin = output_dir.joinpath("cameras.bin")
+    write_cameras_text(cameras, path=camera_filename_txt)
+    # write_cameras_binary(cameras, path_to_model_file=camera_filename_bin)
+    CONSOLE.log("[bold green]:tada: Done writing the merged cameras intrinsics file!")
+
+    #### preparing data for images.txt
+    image_ids = []
+    image_names = []
+    frames = data["frames"]
+    tvecs, qvecs = [], []
+    for frame in frames:
+        image_id = frame["colmap_im_id"]
+        file_path = frame["file_path"]
+        # original_path = frame["original_path"]
+        transform_matrix =  np.array(frame["transform_matrix"])
+        c2w = transform_matrix
+        if not keep_original_world_coordinate:
+            c2w[2, :] *= -1
+            c2w = c2w[np.array([0, 2, 1, 3]), :]
+        c2w[0:3, 1:3] *= -1
+
+        w2c = np.linalg.inv(c2w)
+        translation = w2c[:3,3]
+        rotation = w2c[:3,:3]
+        tvec = translation
+        qvec = R.from_matrix(rotation).as_quat()
+        # qvec = rotmat2qvec(rotation)
+        qvec = qvec[np.array([3, 0, 1, 2])]
+        image_name = file_path
+        qvecs.append(qvec)
+        tvecs.append(tvec)
+        image_ids.append(image_id)
+        image_names.append(image_name)
+        # original_paths.append(original_path)
+
+    # write images.txt
+    qvecs = [list(qvec) for qvec in qvecs]
+    tvecs = [list(tvec) for tvec in tvecs]
+    # camera_ids = [camera_id for _ in image_ids]
+    camera_ids = [camera_id for _ in image_ids]
+    images = {}
+    image_infos = []
+    for im_id, qvec, tvec, cam_id, im_name in zip(image_ids, qvecs, tvecs, camera_ids, image_names):
+        image_info = [im_id] + qvec + tvec + [cam_id] + [im_name]
+        image_info = [str(im_info) for im_info in image_info]
+        image_infos.append(image_info)
+
+        images[im_id] = Image(
+                id=im_id,
+                qvec=np.array(qvec),
+                tvec=np.array(tvec),
+                camera_id=cam_id,
+                name=im_name,
+                xys=np.zeros([1,2]),
+                point3D_ids=-np.ones([1]),
+        )
+
+    image_filename_txt = output_dir.joinpath("images.txt")
+    image_filename_bin = output_dir.joinpath("images.bin")
+    write_images_text(images, path = image_filename_txt)
+    # write_images_binary(images, path_to_model_file=image_filename_bin)
+    CONSOLE.log("[bold green]:tada: Done writing the merged images extrinsics file!")
+
+
+def ply_to_colmap(sparse_ply: Path, output_dir: Path):
+    plydata = PlyData.read(sparse_ply)
+    vertex = plydata["vertex"]
+
+    points3D = {}
+    counter = 0
+    for data in vertex:
+        data = list(data)
+        newdata = [counter] + data + [0.0] + [0, 0.0] 
+        newdata = [str(dt) for dt in newdata]
+        counter += 1
+        error = 0.0
+        points3D[counter] = Point3D(
+            id=counter, xyz=data[:3], rgb=data[3:], error=error, image_ids=str(counter), point2D_idxs=np.zeros([1])
+        )
+
+    point3d_filename_txt = output_dir.joinpath("points3D.txt")
+    point3d_filename_bin = output_dir.joinpath("points3D.bin")
+    write_points3D_text(points3D, path=point3d_filename_txt)
+    # write_points3D_binary(points3D, path_to_model_file=point3d_filename_bin)
+    CONSOLE.log("[bold green]:tada: Done writing the merged point3D cloud file!")
 
 
 def create_sfm_depth(

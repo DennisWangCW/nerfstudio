@@ -103,7 +103,7 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
     """Whether to assume all images are same dimensions and so to use fast downscaling with no autorotation."""
     get_full_images: bool = False
     """Whether to output all the images of the video."""
-    num_overlapped_chunks: int = 1
+    num_overlapped_chunks: int = 0
     """The number of overlapped video chunks to split. Video chunks would be stored as images."""
     target_frames_per_chunk: int = 300
     """The number images in each video chunk."""
@@ -111,7 +111,7 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
     """Sampling strategies used for sampling images in each video chunk."""
     overlapped_fraction: float = 1 / 3
     """Overlapped fraction of two adjacent video/image chunks."""
-    skip_processing_video: bool = False 
+    skip_video_processing: bool = False 
     """Skip the video to image processing procedure."""
     grid_size: float = 50
     """Grid size of the covered area."""
@@ -199,19 +199,18 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
             return image_id_to_depth_path, summary_log
         return None, summary_log
 
-    def _run_colmap_image_undistortion(self, many_chunks=False):
-        if many_chunks:
-            chunk_paths = self.undistorted_dir.iterdir()
-            for chunk_path in chunk_paths:
-                colmap_utils.run_colmap_image_undistortion(
-                    image_dir=chunk_path,
-                    colmap_cmd=self.colmap_cmd,
-            )
-        else:
-            colmap_utils.run_colmap_image_undistortion(
-                    image_dir=self.undistorted_dir,
-                    colmap_cmd=self.colmap_cmd,
-            )
+    def _run_colmap_image_undistortion(self):
+        colmap_utils.run_colmap_image_undistortion(
+                image_dir=self.output_dir,
+                colmap_cmd=self.colmap_cmd)
+    
+    def _run_json_and_ply_to_colmap(self, output_dir: Path):
+        json_file = output_dir.joinpath("transforms.json")
+        sparse_ply = output_dir.joinpath("sparse_pc.ply")
+        colmap_path = output_dir.joinpath("colmap").joinpath("sparse").joinpath("0")
+        colmap_path.mkdir(exist_ok=True, parents=True)
+        colmap_utils.json_to_colmap(json_file=json_file, output_dir=colmap_path)
+        colmap_utils.ply_to_colmap(sparse_ply=sparse_ply, output_dir=colmap_path)
 
     def _run_colmap(self, mask_path: Optional[Path] = None):
         """
