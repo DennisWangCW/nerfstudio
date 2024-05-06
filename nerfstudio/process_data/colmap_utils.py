@@ -445,11 +445,6 @@ def parse_colmap_camera_params(camera) -> Dict[str, Any]:
     return out
 
 
-def calculate_mse(image1, image2):
-    # 计算图像之间的均方误差
-    mse = np.mean((image1 - image2) ** 2)
-    return mse
-
 def colmap_to_json(
     recon_dir: Path,
     output_dir: Path,
@@ -559,18 +554,24 @@ def json_to_colmap(json_file: Path, output_dir: Path, keep_original_world_coordi
         data = json.load(f)
     
     #### preparing data for cameras.txt
-    w = data["w"]
-    h = data["h"]
-    fl_x = data["fl_x"]
-    fl_y = data["fl_y"]
-    cx = data["cx"]
-    cy = data["cy"]
-    k1 = data["k1"]
-    k2 = data["k2"]
-    p1 = data["p1"]
-    p2 = data["p2"]
-    params = [fl_x, fl_y, cx, cy, k1, k2, p1, p2]
     camera_model = data["camera_model"]
+    assert camera_model == "PINHOLE" or camera_model == "OPENCV", "currently only support pinhole or opencv"
+    params = []
+    if camera_model == "PINHOLE" or camera_model == "OPENCV":
+        w = data["w"]
+        h = data["h"]
+        fl_x = data["fl_x"]
+        fl_y = data["fl_y"]
+        cx = data["cx"]
+        cy = data["cy"]
+        params = params + [fl_x, fl_y, cx, cy]
+    if camera_model == "OPENCV":
+        k1 = data["k1"]
+        k2 = data["k2"]
+        p1 = data["p1"]
+        p2 = data["p2"]
+        params =params + [k1, k2, p1, p2]
+    
     camera_id = 1
 
     cameras = {}
