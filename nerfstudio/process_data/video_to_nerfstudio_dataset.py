@@ -140,10 +140,22 @@ class VideoToNerfstudioDataset(ColmapConverterToNerfstudioDataset):
 
             if not self.skip_colmap:
                 if self.undistorted:
-                    process_data_utils.colmap_multiprocessing(image_dir=self.sample_dir, output_dir=self.undistorted_dir, parallel=self.parallel_colmap, undistorted=self.undistorted, skip_colmap=self.skip_colmap, skip_image_processing=self.skip_video_processing)
+                    process_data_utils.colmap_multiprocessing(image_dir=self.sample_dir,
+                                                              output_dir=self.undistorted_dir,
+                                                              parallel=self.parallel_colmap, 
+                                                              undistorted=self.undistorted, 
+                                                              skip_colmap=self.skip_colmap, 
+                                                              skip_image_processing=self.skip_video_processing, 
+                                                              maximum_repeat=self.maximum_repeat)
                     CONSOLE.log("[bold green]:tada: Done Colmap processing for each chunk! Images are undistorted version!")
                 else:
-                    process_data_utils.colmap_multiprocessing(image_dir=self.sample_dir, output_dir=self.distorted_dir, parallel=self.parallel_colmap, undistorted=self.undistorted, skip_colmap=self.skip_colmap, skip_image_processing=self.skip_video_processing)
+                    process_data_utils.colmap_multiprocessing(image_dir=self.sample_dir, 
+                                                              output_dir=self.distorted_dir, 
+                                                              parallel=self.parallel_colmap, 
+                                                              undistorted=self.undistorted, 
+                                                              skip_colmap=self.skip_colmap, 
+                                                              skip_image_processing=self.skip_video_processing, 
+                                                              maximum_repeat=self.maximum_repeat)
                     CONSOLE.log("[bold green]:tada: Done Colmap processing for each chunk! Images are distorted version!")
             # if self.undistorted:
             #     # process_data_utils.undistorting_images(image_dir=self.sample_dir, output_dir=self.undistorted_dir, num_overlapped_chunks=self.num_overlapped_chunks)

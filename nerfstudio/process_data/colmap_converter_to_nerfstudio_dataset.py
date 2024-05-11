@@ -119,8 +119,10 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
     """Running colmap in parallel."""
     undistorted: bool = False 
     """Undistorted each images for Gaussian Splatting"""
-    matched_ratio: float = 0.9 
-    """Sometimes colmap cannot found poses for most images, retry until it found! Note that the maximum retry times is 10 """
+    maximum_repeat: int = 5
+    """Maximum repeat times for running Colmap """
+    rank: int = 0
+    """Rank ID, used for multiprocessing """
 
 
     @staticmethod
@@ -243,6 +245,7 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
                 camera_model=CAMERA_MODELS[self.camera_type],
                 camera_mask_path=mask_path,
                 gpu=self.gpu,
+                rank=self.rank,
                 verbose=self.verbose,
                 matching_method=self.matching_method,
                 refine_intrinsics=self.refine_intrinsics,

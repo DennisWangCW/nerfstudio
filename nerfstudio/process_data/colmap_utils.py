@@ -149,6 +149,7 @@ def run_colmap(
     camera_model: CameraModel,
     camera_mask_path: Optional[Path] = None,
     gpu: bool = True,
+    rank: int = 0,
     verbose: bool = False,
     matching_method: Literal["vocab_tree", "exhaustive", "sequential"] = "vocab_tree",
     refine_intrinsics: bool = True,
@@ -183,7 +184,10 @@ def run_colmap(
         f"--SiftExtraction.use_gpu {int(gpu)}",
     ]
     if int(gpu):
-        feature_extractor_cmd.append(f"--SiftExtraction.gpu_index={','.join(map(str, range(get_available_gpus())))}")
+        # feature_extractor_cmd.append(f"--SiftExtraction.gpu_index={','.join(map(str, range(get_available_gpus())))}")
+        num_gpus = get_available_gpus()
+        if num_gpus > 0:
+            feature_extractor_cmd.append(f"--SiftExtraction.gpu_index={rank % num_gpus}")
     if camera_mask_path is not None:
         feature_extractor_cmd.append(f"--ImageReader.camera_mask_path {camera_mask_path}")
     feature_extractor_cmd = " ".join(feature_extractor_cmd)
@@ -199,7 +203,10 @@ def run_colmap(
         f"--SiftMatching.use_gpu {int(gpu)}",
     ]
     if int(gpu):
-        feature_matcher_cmd.append(f"--SiftMatching.gpu_index={','.join(map(str, range(get_available_gpus())))}")
+        # feature_matcher_cmd.append(f"--SiftMatching.gpu_index={','.join(map(str, range(get_available_gpus())))}")
+        num_gpus = get_available_gpus()
+        if num_gpus > 0:
+            feature_matcher_cmd.append(f"--SiftMatching.gpu_index={rank % num_gpus}")
     if matching_method == "vocab_tree":
         vocab_tree_filename = get_vocab_tree()
         feature_matcher_cmd.append(f'--VocabTreeMatching.vocab_tree_path "{vocab_tree_filename}"')
